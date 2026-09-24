@@ -1,0 +1,7 @@
+# Offline data-preparation dependencies for the CubiCasa5K -> YOLOv8-OBB
+# conversion pipeline (training/). Not required by the FastAPI service at
+# runtime -- install alongside requirements.txt only when preparing training data:
+#   pip install -r requirements.txt -r requirements-training.txt
+lxml>=5.0.0
+shapely>=2.0.0
+tqdm>=4.66.0
