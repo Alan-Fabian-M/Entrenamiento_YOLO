@@ -11,6 +11,10 @@ httpx>=0.27.0
 ultralytics>=8.3.0
 pytesseract>=0.3.10
 pydantic>=2.0.0
+shapely>=2.0.0
+
+# CubiCasa5K raw SVG training pipeline (training/cubicasa/, tests/test_cubicasa_conversion.py)
+lxml>=5.0.0
 
 # pytesseract needs the Tesseract OCR *binary* installed separately at the OS level:
 #   Fedora/RHEL: sudo dnf install tesseract

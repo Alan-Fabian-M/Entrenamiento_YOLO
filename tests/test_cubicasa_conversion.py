@@ -1,8 +1,14 @@
-"""Tests for the CubiCasa5K -> YOLOv8-OBB conversion pipeline.
+"""Tests for the CubiCasa5K -> YOLOv8-seg conversion pipeline.
 
 Uses synthetic in-memory SVG/image fixtures (no real CubiCasa5K dataset
-required), mirroring the synthetic-floorplan approach in test_preprocess.py.
+required), mirroring the synthetic-floorplan approach in test_preprocess.py,
+PLUS a handful of real `model.svg`/image pairs under `tests/fixtures/
+cubicasa5k_real/` (downloaded from the actual Zenodo dataset, record
+2613548) so the parser and class mapper are validated against the real SVG
+schema, not just hand-built approximations of it.
 """
+
+from pathlib import Path
 
 import numpy as np
 import cv2
@@ -13,7 +19,7 @@ from training.cubicasa.svg_transform import SvgTransform, SvgTransformError
 from training.cubicasa.class_mapping import ClassMapper
 from training.cubicasa.svg_parser import CubiCasaSvgParser
 from training.cubicasa.obb_converter import ObbConverter, ObbConversionError
-from training.cubicasa.dataset_builder import BuildConfig, YoloObbDatasetBuilder
+from training.cubicasa.dataset_builder import BuildConfig, YoloSegDatasetBuilder
 
 
 # --- svg_transform.py -------------------------------------------------------
@@ -59,14 +65,14 @@ def test_transform_invalid_function_raises():
 
 def test_class_mapper_normalizes_case_and_whitespace():
     ClassMapper.reset_unrecognized_classes()
-    assert ClassMapper.map_to_unified("  SOFA  ") == "sofa"
-    assert ClassMapper.map_to_unified("Kitchen   Cabinet") == "cabinet"
+    assert ClassMapper.map_to_unified("  FixedFurniture   Toilet  ") == "toilet"
+    assert ClassMapper.map_to_unified("Space Kitchen") == "kitchen"
 
 
-def test_class_mapper_returns_none_for_excluded_class():
+def test_class_mapper_returns_none_for_excluded_wrapper_class():
     ClassMapper.reset_unrecognized_classes()
-    assert ClassMapper.map_to_unified("Wall") is None
-    assert "wall" not in ClassMapper.get_unrecognized_classes()
+    assert ClassMapper.map_to_unified("FixedFurnitureSet") is None
+    assert "fixedfurnitureset" not in ClassMapper.get_unrecognized_classes()
 
 
 def test_class_mapper_reports_unrecognized_raw_class():
@@ -76,16 +82,28 @@ def test_class_mapper_reports_unrecognized_raw_class():
     assert ClassMapper.normalize_raw_class("SomeUnknownIconType") in ClassMapper.get_unrecognized_classes()
 
 
+def test_class_mapper_prefix_fallback_covers_unlisted_variants():
+    ClassMapper.reset_unrecognized_classes()
+    # Not in the explicit table, but matches the "door"/"space " prefix fallback.
+    assert ClassMapper.map_to_unified("Door Swing SomeNewVariant") == "door"
+    assert ClassMapper.map_to_unified("Space SomeNewRoomType") == "room"
+
+
 def test_class_mapper_class_id_matches_declared_order():
     from training.cubicasa.class_mapping import YOLO_CLASSES
-    assert ClassMapper.class_id("door") == 0
-    assert ClassMapper.class_id("window") == 1
-    assert YOLO_CLASSES[ClassMapper.class_id("sofa")] == "sofa"
+    assert ClassMapper.class_id("wall") == 0
+    assert ClassMapper.class_id("door") == 1
+    assert YOLO_CLASSES[ClassMapper.class_id("bathroom")] == "bathroom"
 
 
 # --- svg_parser.py ------------------------------------------------------------
 
 def _build_sample_svg() -> etree._Element:
+    """Mirrors the REAL CubiCasa5K structure verified against actual dataset
+    samples: the semantic class lives on an ancestor <g> (e.g.
+    `<g class="FixedFurniture Toilet"><g class="BoundaryPolygon">
+    <polygon .../></g></g>`), never on the geometry-bearing leaf itself.
+    """
     svg = etree.Element("svg", nsmap=None)
     svg.set("viewBox", "0 0 100 100")
 
@@ -95,43 +113,66 @@ def _build_sample_svg() -> etree._Element:
     inner_group = etree.SubElement(outer_group, "g")
     inner_group.set("transform", "scale(2)")
 
-    sofa = etree.SubElement(inner_group, "polygon")
-    sofa.set("class", "Sofa")
+    sofa_group = etree.SubElement(inner_group, "g")
+    sofa_group.set("class", "FixedFurniture Sofa")
+    sofa_boundary = etree.SubElement(sofa_group, "g")
+    sofa_boundary.set("class", "BoundaryPolygon")
+    sofa = etree.SubElement(sofa_boundary, "polygon")
     sofa.set("points", "0,0 5,0 5,5 0,5")
 
-    wall = etree.SubElement(svg, "polygon")
-    wall.set("class", "Wall")
+    wall_group = etree.SubElement(svg, "g")
+    wall_group.set("class", "Wall")
+    wall = etree.SubElement(wall_group, "polygon")
     wall.set("points", "0,0 100,0 100,2 0,2")
 
-    door = etree.SubElement(svg, "polygon")
-    door.set("class", "Door 1-panel")
-    door.set("transform", "translate(50,50) rotate(45)")
+    door_group = etree.SubElement(svg, "g")
+    door_group.set("class", "Door 1-panel")
+    door_group.set("transform", "translate(50,50) rotate(45)")
+    door = etree.SubElement(door_group, "polygon")
     door.set("points", "0,0 10,0 10,4 0,4")
 
-    degenerate = etree.SubElement(svg, "polygon")
-    degenerate.set("class", "Sink")
+    sink_group = etree.SubElement(svg, "g")
+    sink_group.set("class", "FixedFurniture Sink")
+    degenerate = etree.SubElement(sink_group, "polygon")
     degenerate.set("points", "0,0 1,1 2,2")  # collinear -> zero area
 
-    straight_path = etree.SubElement(svg, "path")
-    straight_path.set("class", "Table")
+    table_group = etree.SubElement(svg, "g")
+    table_group.set("class", "FixedFurniture Table")
+    straight_path = etree.SubElement(table_group, "path")
     straight_path.set("d", "M 20,20 L 30,20 L 30,30 L 20,30 Z")
 
-    curved_path = etree.SubElement(svg, "path")
-    curved_path.set("class", "Chair")
+    chair_group = etree.SubElement(svg, "g")
+    chair_group.set("class", "FixedFurniture Chair")
+    curved_path = etree.SubElement(chair_group, "path")
     curved_path.set("d", "M 40,40 C 45,45 55,45 60,40")
+
+    # Decorative wrapper directly on top of geometry, with no recognized
+    # semantic ancestor anywhere above it -- must be dropped entirely.
+    dimension_group = etree.SubElement(svg, "g")
+    dimension_group.set("class", "DimensionMark")
+    stray = etree.SubElement(dimension_group, "polygon")
+    stray.set("points", "70,70 75,70 75,75 70,75")
 
     return svg
 
 
-def test_svg_parser_excludes_nothing_at_walk_level_but_applies_viewbox_scale():
+def test_svg_parser_resolves_nearest_semantic_ancestor_class():
     svg_root = _build_sample_svg()
     image_shape = (200, 200, 3)  # 2x viewBox -> scale factor 2
     annotations = CubiCasaSvgParser.walk_and_collect(svg_root, image_shape)
 
     classes_found = {a.raw_class for a in annotations}
-    assert "Sofa" in classes_found
+    assert "FixedFurniture Sofa" in classes_found
     assert "Wall" in classes_found  # walk_and_collect doesn't filter; class_mapping does
-    assert "Chair" not in classes_found  # curved path unsupported, dropped
+    assert "FixedFurniture Chair" not in classes_found  # curved path unsupported, dropped
+
+
+def test_svg_parser_drops_geometry_with_no_semantic_ancestor():
+    svg_root = _build_sample_svg()
+    annotations = CubiCasaSvgParser.walk_and_collect(svg_root, (100, 100, 3))
+    assert not any(a.raw_class == "DimensionMark" for a in annotations)
+    # Nothing at all should be tagged from that stray polygon's own coordinates.
+    assert all(not np.array_equal(a.points_px[0], [70.0, 70.0]) for a in annotations)
 
 
 def test_svg_parser_applies_viewbox_scale_to_image_dimensions():
@@ -139,7 +180,7 @@ def test_svg_parser_applies_viewbox_scale_to_image_dimensions():
     image_shape = (200, 200, 3)
     annotations = CubiCasaSvgParser.walk_and_collect(svg_root, image_shape)
 
-    sofa_ann = next(a for a in annotations if a.raw_class == "Sofa")
+    sofa_ann = next(a for a in annotations if a.raw_class == "FixedFurniture Sofa")
     # local (0,0)->scale(2)->(0,0); translate(10,10)->(10,10); viewbox scale x2 -> (20,20)
     np.testing.assert_allclose(sofa_ann.points_px[0], [20.0, 20.0])
     # local (5,5)->scale(2)->(10,10); translate(10,10)->(20,20); viewbox scale x2 -> (40,40)
@@ -150,7 +191,7 @@ def test_svg_parser_straight_path_is_extracted():
     svg_root = _build_sample_svg()
     image_shape = (100, 100, 3)
     annotations = CubiCasaSvgParser.walk_and_collect(svg_root, image_shape)
-    table_ann = next(a for a in annotations if a.raw_class == "Table")
+    table_ann = next(a for a in annotations if a.raw_class == "FixedFurniture Table")
     assert table_ann.points_px.shape[0] >= 4
 
 
@@ -223,7 +264,7 @@ def test_dataset_builder_writes_expected_directory_structure(tmp_path):
         splits={"train": train_split, "val": val_split, "test": test_split},
     )
 
-    report = YoloObbDatasetBuilder.build(config)
+    report = YoloSegDatasetBuilder.build(config)
 
     sample_id = "high_quality_sample_001"
     assert (output_root / "images" / "train" / f"{sample_id}.png").exists()
@@ -232,10 +273,79 @@ def test_dataset_builder_writes_expected_directory_structure(tmp_path):
     assert report.total_samples == 1
     assert report.skipped_samples == 0
 
+    label_text = (output_root / "labels" / "train" / f"{sample_id}.txt").read_text()
+    lines = [l for l in label_text.splitlines() if l.strip()]
+    assert lines, "expected at least one seg label line (Wall/FixedFurniture Sofa/etc)"
+    for line in lines:
+        parts = line.split()
+        # class_id + at least 3 (x, y) pairs = 1 + 6 tokens, and always an odd
+        # total (class_id, then an even count of coordinate values).
+        assert len(parts) >= 7
+        assert (len(parts) - 1) % 2 == 0
+
 
 def test_data_yaml_contains_all_class_names_in_order(tmp_path):
     from training.cubicasa.class_mapping import YOLO_CLASSES
-    YoloObbDatasetBuilder.write_data_yaml(tmp_path, YOLO_CLASSES)
+    YoloSegDatasetBuilder.write_data_yaml(tmp_path, YOLO_CLASSES)
     content = (tmp_path / "data.yaml").read_text()
     for i, name in enumerate(YOLO_CLASSES):
         assert f"{i}: {name}" in content
+
+
+# --- real CubiCasa5K fixtures (downloaded from Zenodo record 2613548) ---------
+
+_REAL_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "cubicasa5k_real"
+_REAL_SAMPLE_IDS = sorted(
+    p.stem.replace("_model", "") for p in _REAL_FIXTURES_DIR.glob("*_model.svg")
+)
+
+
+@pytest.mark.parametrize("sample_id", _REAL_SAMPLE_IDS)
+def test_walk_and_collect_resolves_real_semantic_classes(sample_id):
+    """Against a REAL CubiCasa5K SVG (not a synthetic approximation), confirm
+    the nearest-ancestor resolution actually finds Wall/Door/Window/Space/
+    FixedFurniture instances -- not just generic wrapper classes like
+    'BoundaryPolygon', and not nothing.
+    """
+    svg_path = _REAL_FIXTURES_DIR / f"{sample_id}_model.svg"
+    img_path = _REAL_FIXTURES_DIR / f"{sample_id}_F1_scaled.png"
+    image = cv2.imread(str(img_path))
+    assert image is not None
+
+    svg_root = CubiCasaSvgParser.load_svg_root(svg_path)
+    annotations = CubiCasaSvgParser.walk_and_collect(svg_root, image.shape)
+
+    assert annotations, f"expected at least one annotation in real sample {sample_id}"
+    raw_classes = {a.raw_class.lower() for a in annotations}
+    assert any(c.startswith("wall") for c in raw_classes), "expected at least one Wall instance"
+    assert not any(c == "boundarypolygon" for c in raw_classes), (
+        "geometry should resolve to its semantic ancestor, not the decorative BoundaryPolygon wrapper"
+    )
+
+
+@pytest.mark.parametrize("sample_id", _REAL_SAMPLE_IDS[:4])
+def test_dataset_builder_produces_nonempty_seg_labels_on_real_sample(sample_id, tmp_path):
+    """End-to-end process_sample() on a real sample: every emitted label line
+    must have >=3 polygon points and a valid, known unified class.
+    """
+    from training.cubicasa.class_mapping import YOLO_CLASSES
+
+    ClassMapper.reset_unrecognized_classes()
+    sample_dir = tmp_path / "sample"
+    sample_dir.mkdir()
+    (sample_dir / "model.svg").write_bytes((_REAL_FIXTURES_DIR / f"{sample_id}_model.svg").read_bytes())
+    (sample_dir / "F1_scaled.png").write_bytes((_REAL_FIXTURES_DIR / f"{sample_id}_F1_scaled.png").read_bytes())
+
+    result = YoloSegDatasetBuilder.process_sample(sample_dir, "F1_scaled.png", "model.svg", min_box_dim_px=3.0)
+    assert result is not None
+    _image, label_lines = result
+
+    assert label_lines, f"expected non-empty labels for real sample {sample_id}"
+    for line in label_lines:
+        parts = line.split()
+        class_id = int(parts[0])
+        assert 0 <= class_id < len(YOLO_CLASSES)
+        coords = parts[1:]
+        assert len(coords) >= 6 and len(coords) % 2 == 0
+        values = [float(v) for v in coords]
+        assert all(0.0 <= v <= 1.0 for v in values)

@@ -158,6 +158,24 @@ class CubiCasaSvgParser:
             return None
         return np.array(points, dtype=np.float64)
 
+    # In real CubiCasa5K SVGs, the semantic class always lives on an ancestor
+    # <g> (e.g. <g class="FixedFurniture Toilet"><g class="BoundaryPolygon">
+    # <polygon .../></g></g>) -- the geometry-bearing leaf itself is either
+    # unclassed or carries a purely structural/decorative class like
+    # "BoundaryPolygon" or "Panel". Only elements whose class starts with one
+    # of these prefixes carry real floor-plan semantics; anything else
+    # (Dimension*, TextLabel*, Panel*, Visual, InnerPolygon*, Glass, Hanger,
+    # Threshold, *Drain, Faucet, Indicator, electricitySign, ...) is UI/markup
+    # noise and must NOT overwrite an already-established semantic ancestor.
+    _SEMANTIC_CLASS_PREFIXES: Tuple[str, ...] = (
+        "wall", "space ", "fixedfurniture", "window", "door", "column", "railing",
+        "stairs", "bench",
+    )
+
+    @classmethod
+    def _is_semantic_class(cls, normalized_lower: str) -> bool:
+        return normalized_lower.startswith(cls._SEMANTIC_CLASS_PREFIXES)
+
     @classmethod
     def walk_and_collect(
         cls,
@@ -166,8 +184,13 @@ class CubiCasaSvgParser:
         target_classes: Optional[Set[str]] = None,
     ) -> List[RawSvgAnnotation]:
         """Recursively walk the SVG tree accumulating transforms, and return
-        every annotated polygon/path/rect element found. If `target_classes`
-        is None, all classed elements are collected (useful for auditing).
+        one annotation per geometry-bearing element, labeled with the nearest
+        SEMANTICALLY MEANINGFUL ancestor class (see `_SEMANTIC_CLASS_PREFIXES`)
+        -- not necessarily the element's own class, which in real CubiCasa5K
+        data is almost always a decorative wrapper class instead. If
+        `target_classes` is None, every recognized semantic class is
+        collected (useful for auditing); otherwise only annotations whose
+        resolved class is in the set are kept.
         """
         scale_x, scale_y = cls.get_viewbox_scale(svg_root, image_shape)
         scale_matrix = np.array(
@@ -176,7 +199,7 @@ class CubiCasaSvgParser:
 
         results: List[RawSvgAnnotation] = []
 
-        def _walk(element: etree._Element, accumulated: np.ndarray) -> None:
+        def _walk(element: etree._Element, accumulated: np.ndarray, active_class: Optional[str]) -> None:
             transform_attr = element.get("transform")
             local_matrix = SvgTransform.parse_transform_attr(transform_attr)
             current = SvgTransform.compose(accumulated, local_matrix)
@@ -184,14 +207,18 @@ class CubiCasaSvgParser:
             raw_class = cls._get_class_attr(element)
             if raw_class:
                 normalized = raw_class.strip()
-                if target_classes is None or normalized.lower() in target_classes:
-                    points = cls._extract_points(element)
-                    if points is not None:
+                if cls._is_semantic_class(normalized.lower()):
+                    active_class = normalized
+
+            if active_class is not None:
+                points = cls._extract_points(element)
+                if points is not None:
+                    if target_classes is None or active_class.lower() in target_classes:
                         world_points = SvgTransform.apply_to_points(current, points)
                         px_points = SvgTransform.apply_to_points(scale_matrix, world_points)
                         results.append(
                             RawSvgAnnotation(
-                                raw_class=normalized,
+                                raw_class=active_class,
                                 points_px=px_points,
                                 element_tag=cls._local_tag(element),
                             )
@@ -199,7 +226,7 @@ class CubiCasaSvgParser:
 
             for child in element:
                 if isinstance(child.tag, str):
-                    _walk(child, current)
+                    _walk(child, current, active_class)
 
-        _walk(svg_root, SvgTransform.IDENTITY.copy())
+        _walk(svg_root, SvgTransform.IDENTITY.copy(), None)
         return results

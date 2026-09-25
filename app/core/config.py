@@ -26,10 +26,16 @@ class Settings:
     TEMP_DIR: Path = BASE_DIR / "temp"
 
     # Furniture & Architectural element detection (Scene Compiler / Fase 2A).
-    # Modelo entrenado con FloorPlanCAD (200 planos arquitectonicos reales).
-    # Clases: wall, single_door, double_door, sliding_door, window, stair, bed, sofa, table, chair, toilet, sink, bath_tub, refrigerator, gas_stove, wardrobe
-    YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "YOLO/best_floorplancad.pt")
-    YOLO_CONFIDENCE_THRESHOLD: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.35"))
+    # Modelo entrenado con CubiCasa5k (5000+ planos CAD reales con anotaciones de segmentación).
+    # Clases: bed, sofa, table, chair, desk, door, window, wall, column, stairs,
+    #         kitchen_counter, toilet, sink, bathtub, wardrobe (15 clases objetivo)
+    YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "YOLO/best_seg.pt")
+    # Tipo de modelo: "detect" (bboxes), "obb" (oriented bboxes), "seg" (segmentation polygons)
+    YOLO_MODEL_TYPE: str = os.getenv("YOLO_MODEL_TYPE", "seg")
+    # NOTE: current best_seg.pt has weak confidence calibration (low training
+    # mAP) -- real detections top out around 0.10-0.15. Once retrained on the
+    # full real CubiCasa5k dataset this should go back up toward 0.35+.
+    YOLO_CONFIDENCE_THRESHOLD: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.05"))
 
     # Fallback room size (meters) used when OCR can't read a written dimension
     # from the sketch. Matches Sala_MVP's default room size.

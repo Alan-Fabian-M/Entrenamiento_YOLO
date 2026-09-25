@@ -32,7 +32,19 @@ _DIMENSION_PATTERN = re.compile(r"(\d+[.,]?\d*)\s*(m|cm|mts?)\b", re.IGNORECASE)
 # restricted to a plausible wall/room-segment range (0.3m-20m in mm) to avoid
 # picking up unrelated numbers (page labels, dates, ids).
 _BARE_MM_PATTERN = re.compile(r"\b(\d{3,5})\b")
-_BARE_MM_MIN, _BARE_MM_MAX = 300, 20000
+_BARE_MM_MIN, _BARE_MM_MAX = 100, 20000
+
+# Separate, more common architectural convention: outer dimension lines
+# labeled as bare decimal meters with no unit at all (e.g. "5.00", "6.00").
+# Tesseract frequently drops the "." on small text ("5.00" -> "500"), which
+# is indistinguishable at the regex level from a genuine bare-mm CAD callout
+# once the text has already been mangled. Disambiguate by plausibility
+# instead: a 3-digit value (100-999) read as millimeters is always under 1m
+# -- implausible as the scale reference for an entire room/floor plan --
+# while read as meters-with-a-lost-decimal-point (value/100) it lands in
+# 1.00m-9.99m, a normal room width. 4-5 digit values keep the plain
+# millimeter reading (a real "5.00" can't OCR-mangle into 4-5 digits).
+_AMBIGUOUS_BARE_MIN, _AMBIGUOUS_BARE_MAX = 100, 999
 
 
 @dataclass
@@ -143,11 +155,18 @@ class ScaleDetector:
                 source="no readable dimension text found in the sketch",
             )
 
-        most_common_mm, _count = Counter(bare_values).most_common(1)[0]
-        meters = most_common_mm / 1000.0
+        most_common, _count = Counter(bare_values).most_common(1)[0]
+
+        if _AMBIGUOUS_BARE_MIN <= most_common <= _AMBIGUOUS_BARE_MAX:
+            meters = most_common / 100.0
+            source_note = f"{most_common} (sin punto decimal, asumido {meters:.2f}m)"
+        else:
+            meters = most_common / 1000.0
+            source_note = f"{most_common}mm (sin unidad, asumido mm)"
+
         pixels_per_meter = room_width_px / meters
         return ScaleResult(
             pixels_per_meter=round(pixels_per_meter, 2),
             confidence=0.5,
-            source=f"OCR:{most_common_mm}mm (sin unidad, asumido mm) vs room_width:{room_width_px}px",
+            source=f"OCR:{source_note} vs room_width:{room_width_px}px",
         )

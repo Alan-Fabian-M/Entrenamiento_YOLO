@@ -1,7 +1,6 @@
-"""Orchestrates the full CubiCasa5K -> YOLOv8-OBB dataset build."""
+"""Orchestrates the full CubiCasa5K -> YOLOv8-seg dataset build."""
 
 import logging
-import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -10,9 +9,7 @@ import numpy as np
 from tqdm import tqdm
 
 from training.cubicasa.class_mapping import ClassMapper, YOLO_CLASSES
-from training.cubicasa.obb_converter import ObbConverter
 from training.cubicasa.svg_parser import CubiCasaSvgParser
-from training.cubicasa.visualizer import Visualizer
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +27,6 @@ class BuildConfig:
     image_filename: str = "F1_scaled.png"
     svg_filename: str = "model.svg"
     min_box_dim_px: float = 3.0
-    generate_visualizations: bool = False
-    vis_sample_rate: float = 0.02
 
 
 @dataclass
@@ -42,9 +37,14 @@ class BuildReport:
     unmapped_raw_classes: set = field(default_factory=set)
 
 
-class YoloObbDatasetBuilder:
-    """Builds a YOLOv8-OBB-ready dataset (images/, labels/, data.yaml) from
-    CubiCasa5K SVG annotations.
+class YoloSegDatasetBuilder:
+    """Builds a YOLOv8-seg-ready dataset (images/, labels/, data.yaml) from
+    CubiCasa5K SVG annotations. Each label line is a full normalized polygon
+    (`class_id x1 y1 x2 y2 ... xn yn`), not a fitted oriented bounding box --
+    that's what `app/services/furniture_detector.py` expects
+    (`YOLO_MODEL_TYPE=seg`) and what actually produced a usable model before
+    (see `training/entrenamiento_cubicasa_colab.ipynb`, which used the same
+    full-polygon format and reached mAP50=0.69).
     """
 
     @staticmethod
@@ -59,6 +59,15 @@ class YoloObbDatasetBuilder:
         return relative_path.strip("/").replace("/", "_").replace("\\", "_")
 
     @staticmethod
+    def _polygon_to_yolo_seg_line(class_id: int, points_px: np.ndarray, img_w: int, img_h: int) -> str:
+        coords = []
+        for x, y in points_px:
+            x_norm = min(max(x / img_w, 0.0), 1.0)
+            y_norm = min(max(y / img_h, 0.0), 1.0)
+            coords.append(f"{x_norm:.6f} {y_norm:.6f}")
+        return f"{class_id} " + " ".join(coords)
+
+    @staticmethod
     def process_sample(
         sample_dir: Path,
         image_filename: str,
@@ -66,7 +75,7 @@ class YoloObbDatasetBuilder:
         min_box_dim_px: float,
     ) -> Optional[Tuple[np.ndarray, List[str]]]:
         """Run the full per-sample pipeline: load image, parse SVG, map
-        classes, convert to OBB, filter degenerate boxes.
+        classes, filter degenerate polygons, emit full-polygon YOLO-seg lines.
         Returns (image, label_lines) or None if the sample cannot be processed.
         """
         image_path = sample_dir / image_filename
@@ -96,18 +105,17 @@ class YoloObbDatasetBuilder:
             if unified is None:
                 continue
 
-            corners_px = ObbConverter.polygon_to_obb(ann.points_px)
-            if corners_px is None:
+            points = ann.points_px
+            if points is None or len(points) < 3:
                 continue
 
-            width = np.linalg.norm(corners_px[1] - corners_px[0])
-            height = np.linalg.norm(corners_px[2] - corners_px[1])
+            width = points[:, 0].max() - points[:, 0].min()
+            height = points[:, 1].max() - points[:, 1].min()
             if min(width, height) < min_box_dim_px:
                 continue
 
             class_id = ClassMapper.class_id(unified)
-            corners_norm = ObbConverter.normalize_corners(corners_px, img_w, img_h)
-            label_lines.append(ObbConverter.to_yolo_obb_line(class_id, corners_norm))
+            label_lines.append(YoloSegDatasetBuilder._polygon_to_yolo_seg_line(class_id, points, img_w, img_h))
 
         return image, label_lines
 
@@ -144,9 +152,6 @@ class YoloObbDatasetBuilder:
     @classmethod
     def build(cls, config: BuildConfig) -> BuildReport:
         report = BuildReport()
-        vis_dir = config.output_root / "visualizations"
-        if config.generate_visualizations:
-            vis_dir.mkdir(parents=True, exist_ok=True)
 
         for split, split_path in config.splits.items():
             relative_paths = cls.read_split_file(split_path)
@@ -173,10 +178,6 @@ class YoloObbDatasetBuilder:
                     report.instances_per_class[class_name] = (
                         report.instances_per_class.get(class_name, 0) + 1
                     )
-
-                if config.generate_visualizations and random.random() < config.vis_sample_rate:
-                    vis_image = Visualizer.draw_obb_labels(image, label_lines, YOLO_CLASSES)
-                    cv2.imwrite(str(vis_dir / f"{sample_id}_vis.png"), vis_image)
 
         report.unmapped_raw_classes = ClassMapper.get_unrecognized_classes()
         cls.write_data_yaml(config.output_root, YOLO_CLASSES)

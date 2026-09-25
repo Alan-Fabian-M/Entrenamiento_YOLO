@@ -10,7 +10,11 @@ list -- is what lets `/api/v1/compilar-sala` be consumed directly by
 Unity side.
 
 Do NOT rename fields here without updating both the Unity C# side and the
-markdown contract doc in the same change.
+markdown contract doc in the same change. New fields must always ship with a
+default so a response built without setting them still round-trips (e.g.
+`rooms`, `room_id`, `room_count` below) -- Unity's JSON parsing is assumed to
+ignore unrecognized fields, but this hasn't been verified from this repo, so
+staying additive-only is what keeps that assumption safe either way.
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ class ElementTransform(BaseModel):
 class ElementProperties(BaseModel):
     color_hex: Optional[str] = None
     material_type: Optional[str] = None
+    room_id: Optional[str] = Field(default=None, description="Which detected room this element belongs to, e.g. 'room_0'. Unset for single-room responses.")
 
 
 class SceneElement(BaseModel):
@@ -86,6 +91,18 @@ class RoomInfo(BaseModel):
     wall_color: str = "white"
 
 
+class RoomShapeInfo(BaseModel):
+    """One detected room among possibly several. `room_info` (singular, above)
+    stays a backward-compatible summary of the whole floor plan's union
+    bounding box; this is the new, additive per-room detail.
+    """
+
+    room_id: str
+    room_type: str = "ambiente"
+    dimensions: RoomDimensions
+    center: Vector3
+
+
 class SceneMetadataDimensions(BaseModel):
     width: float
     depth: float
@@ -101,6 +118,7 @@ class SceneMetadata(BaseModel):
     processing_time_ms: int = 0
     scale_confidence: float = Field(default=0.0, description="0 means no dimension text was OCR'd; a default room size was assumed.")
     scale_source: str = ""
+    room_count: int = Field(default=1, description="Number of rooms detected; 1 for the single-room fallback path.")
 
 
 class SceneGraphResponse(BaseModel):
@@ -111,4 +129,5 @@ class SceneGraphResponse(BaseModel):
 
     metadata: SceneMetadata
     room_info: RoomInfo
+    rooms: List[RoomShapeInfo] = Field(default_factory=list, description="Per-room detail; empty for the single-room fallback path.")
     scene_elements: List[SceneElement]
