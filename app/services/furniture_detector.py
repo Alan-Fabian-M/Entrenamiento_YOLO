@@ -27,31 +27,24 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Mapping of dataset class names (COCO + FloorPlanCAD + CubiCasa5k) -> unified type understood by Unity.
+# Mapping of dataset class names -> unified type understood by Unity.
+# Covers the current unified model (29 classes, CubiCasa5K + FloorPlanCAD, see
+# YOLO/docs/05_*.md) plus the legacy COCO / FloorPlanCAD names so older weights
+# keep working.
 CLASS_TO_UNITY_TYPE = {
     # COCO mappings
     "couch": "sofa",
-    "chair": "silla",
-    "bed": "cama",
     "dining table": "mesa",
     "tv": "tv",
-    "refrigerator": "refrigerador",
-    "sink": "lavabo",
-    "toilet": "inodoro",
     "oven": "horno",
     "microwave": "microondas",
-    # FloorPlanCAD mappings
+    # Legacy FloorPlanCAD names
     "single_door": "puerta",
     "double_door": "puerta_doble",
     "sliding_door": "puerta_corrediza",
-    "window": "ventana",
     "stair": "escalera",
-    "sofa": "sofa",
-    "table": "mesa",
     "bath_tub": "tina",
-    "gas_stove": "estufa",
-    "wardrobe": "armario",
-    # CubiCasa5k segmentation classes (YOLOv8-seg trained on real CAD floor plans)
+    # Shared by every model (legacy + unified)
     "bed": "cama",
     "sofa": "sofa",
     "table": "mesa",
@@ -66,12 +59,23 @@ CLASS_TO_UNITY_TYPE = {
     "sink": "lavabo",
     "bathtub": "tina",
     "wardrobe": "armario",
-    # NB: "wall" class is intentionally NOT mapped. Walls are
-    # the room boundary and are emitted by RoomExtractor.build_wall_elements()
-    # as the 4 structural muros; letting YOLO also emit per-segment "wall"
-    # detections would duplicate/conflict with those in the Unity scene.
+    "refrigerator": "refrigerador",
+    "gas_stove": "estufa",
+    # Unified model additions
+    "shower": "ducha",
+    "fireplace": "chimenea",
+    # NB: intentionally NOT mapped:
+    #  - "wall": the room boundary is emitted by RoomExtractor as structural
+    #    muros; per-segment YOLO walls would duplicate/conflict with those.
+    #  - "room", "bathroom", "kitchen", "living_room", "bedroom", "dining_room",
+    #    "outdoor": areas, not furniture (candidates to feed room_type later).
+    #  - "cabinet", "electrical_appliance", "bench", "misc_furniture": weak in
+    #    validation (mAP50 < 0.1) and no known Unity prefab; add once verified.
 }
 COCO_CLASS_TO_UNITY_TYPE = CLASS_TO_UNITY_TYPE
+
+# Classes only learned from FloorPlanCAD's dark-background renders.
+_INVERTED_ONLY_CLASSES = {"bed", "sofa", "table", "chair", "refrigerator", "gas_stove"}
 
 
 @dataclass
@@ -82,6 +86,33 @@ class DetectedFurniture:
     size_px: Tuple[float, float]
     angle_deg: float
     color_hex: str
+
+
+def _box_iou(a: DetectedFurniture, b: DetectedFurniture) -> float:
+    """IoU of the axis-aligned boxes implied by center/size (rotation ignored)."""
+    ax0, ay0 = a.center_px[0] - a.size_px[0] / 2, a.center_px[1] - a.size_px[1] / 2
+    ax1, ay1 = a.center_px[0] + a.size_px[0] / 2, a.center_px[1] + a.size_px[1] / 2
+    bx0, by0 = b.center_px[0] - b.size_px[0] / 2, b.center_px[1] - b.size_px[1] / 2
+    bx1, by1 = b.center_px[0] + b.size_px[0] / 2, b.center_px[1] + b.size_px[1] / 2
+    iw, ih = min(ax1, bx1) - max(ax0, bx0), min(ay1, by1) - max(ay0, by0)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = a.size_px[0] * a.size_px[1] + b.size_px[0] * b.size_px[1] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def suppress_overlaps(
+    detections: List[DetectedFurniture], iou_threshold: float = 0.5
+) -> List[DetectedFurniture]:
+    """Class-agnostic NMS: YOLO's own NMS is per-class, so one object can come
+    back as e.g. both `sofa` and `cama`. Keep the most confident of any
+    overlapping pair."""
+    kept: List[DetectedFurniture] = []
+    for det in sorted(detections, key=lambda d: d.confidence, reverse=True):
+        if all(_box_iou(det, k) < iou_threshold for k in kept):
+            kept.append(det)
+    return kept
 
 
 class FurnitureDetector:
@@ -202,10 +233,38 @@ class FurnitureDetector:
         # whatever survives that internal cutoff, so it must be passed here
         # too -- otherwise lowering settings.YOLO_CONFIDENCE_THRESHOLD has no
         # effect and low-confidence detections never reach our filter at all.
-        results = model(image_bgr, conf=settings.YOLO_CONFIDENCE_THRESHOLD, verbose=False)
+        # Domain gap: FloorPlanCAD (the only source of bed/sofa/table/chair/
+        # refrigerator/gas_stove) is rendered light-lines-on-BLACK, while user
+        # plans are dark-lines-on-white (like CubiCasa5K). Those classes are
+        # therefore read from an inverted copy of light-background plans; all
+        # other classes come from the original image. Geometry is unchanged.
+        passes: List[Tuple[np.ndarray, callable, int]] = [
+            (image_bgr, lambda name: True, settings.YOLO_IMAGE_SIZE)
+        ]
+        if _INVERTED_ONLY_CLASSES <= set(model.names.values()) and cv2.cvtColor(
+            image_bgr, cv2.COLOR_BGR2GRAY
+        ).mean() > 127:
+            passes = [
+                (image_bgr, lambda name: name not in _INVERTED_ONLY_CLASSES, settings.YOLO_IMAGE_SIZE),
+                (
+                    cv2.bitwise_not(image_bgr),
+                    lambda name: name in _INVERTED_ONLY_CLASSES,
+                    settings.YOLO_FURNITURE_IMAGE_SIZE,
+                ),
+            ]
+
+        pass_results = []
+        for pass_image, allowed, imgsz in passes:
+            for result in model(
+                pass_image,
+                conf=settings.YOLO_CONFIDENCE_THRESHOLD,
+                imgsz=imgsz,
+                verbose=False,
+            ):
+                pass_results.append((result, allowed))
         detections: List[DetectedFurniture] = []
 
-        for result in results:
+        for result, allowed in pass_results:
             names = result.names
 
             # ===== Segmentation model (YOLOv8-seg): polygon masks =====
@@ -217,6 +276,8 @@ class FurnitureDetector:
                     box = result.boxes[i]
                     class_id = int(box.cls[0])
                     coco_name = names[class_id]
+                    if not allowed(coco_name):
+                        continue
                     confidence = float(box.conf[0])
 
                     if confidence < settings.YOLO_CONFIDENCE_THRESHOLD:
@@ -241,6 +302,8 @@ class FurnitureDetector:
             elif model_type == "obb" and result.obb is not None:
                 for box in result.obb:
                     coco_name = names[int(box.cls[0])]
+                    if not allowed(coco_name):
+                        continue
                     unity_type = COCO_CLASS_TO_UNITY_TYPE.get(coco_name)
                     confidence = float(box.conf[0])
                     if unity_type is None or confidence < settings.YOLO_CONFIDENCE_THRESHOLD:
@@ -267,6 +330,8 @@ class FurnitureDetector:
                     continue
                 for box in result.boxes:
                     coco_name = names[int(box.cls[0])]
+                    if not allowed(coco_name):
+                        continue
                     unity_type = COCO_CLASS_TO_UNITY_TYPE.get(coco_name)
                     confidence = float(box.conf[0])
                     if unity_type is None or confidence < settings.YOLO_CONFIDENCE_THRESHOLD:
@@ -286,4 +351,4 @@ class FurnitureDetector:
                         )
                     )
 
-        return detections
+        return suppress_overlaps(detections)

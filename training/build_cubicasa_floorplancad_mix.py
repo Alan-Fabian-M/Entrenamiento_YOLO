@@ -125,14 +125,24 @@ def _bbox_to_polygon_line(line: str, remap: Dict[int, int]) -> str | None:
 
 def _copy_pairs_remapped(
     pairs: List[Tuple[Path, Path]], prefix: str, img_out: Path, lbl_out: Path,
-    remap: Dict[int, int], line_converter,
+    remap: Dict[int, int], line_converter, max_workers: int = 32,
 ) -> Tuple[int, int]:
+    """Copy images + rewrite labels in parallel (threads): on network-backed
+    storage like a mounted Google Drive the cost is per-file latency, so many
+    concurrent copies are far faster than one at a time. Images already copied
+    with the same size are skipped, so an interrupted run resumes cheaply.
+    """
     import shutil
+    from concurrent.futures import ThreadPoolExecutor
 
-    n_instances = 0
-    for img_path, label_path in pairs:
+    from tqdm import tqdm
+
+    def _one(pair: Tuple[Path, Path]) -> int:
+        img_path, label_path = pair
         new_stem = f"{prefix}__{img_path.stem}"
-        shutil.copy2(img_path, img_out / f"{new_stem}{img_path.suffix.lower()}")
+        img_dst = img_out / f"{new_stem}{img_path.suffix.lower()}"
+        if not (img_dst.exists() and img_dst.stat().st_size == img_path.stat().st_size):
+            shutil.copy2(img_path, img_dst)
 
         new_lines: List[str] = []
         if label_path.is_file():
@@ -142,11 +152,14 @@ def _copy_pairs_remapped(
                 converted = line_converter(raw_line, remap)
                 if converted is not None:
                     new_lines.append(converted)
-        n_instances += len(new_lines)
         (lbl_out / f"{new_stem}.txt").write_text(
             "\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8"
         )
-    return len(pairs), n_instances
+        return len(new_lines)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        counts = list(tqdm(executor.map(_one, pairs), total=len(pairs), desc=f"  {prefix}"))
+    return len(pairs), sum(counts)
 
 
 def build_unified_dataset(

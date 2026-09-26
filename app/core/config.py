@@ -26,16 +26,19 @@ class Settings:
     TEMP_DIR: Path = BASE_DIR / "temp"
 
     # Furniture & Architectural element detection (Scene Compiler / Fase 2A).
-    # Modelo entrenado con CubiCasa5k (5000+ planos CAD reales con anotaciones de segmentación).
-    # Clases: bed, sofa, table, chair, desk, door, window, wall, column, stairs,
-    #         kitchen_counter, toilet, sink, bathtub, wardrobe (15 clases objetivo)
-    YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "YOLO/best_seg.pt")
+    # Unified YOLOv8s-seg model trained on CubiCasa5K (real SVG) + FloorPlanCAD,
+    # 29 classes (see YOLO/unified_train data.yaml / YOLO/docs/05_*.md).
+    # Furniture from FloorPlanCAD (bed/sofa/table/chair/refrigerator) validates
+    # at mAP50 ~0.75-0.9; toilet/sink/window are weak (~0.05-0.23).
+    YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "YOLO/best_unified_seg.pt")
     # Tipo de modelo: "detect" (bboxes), "obb" (oriented bboxes), "seg" (segmentation polygons)
     YOLO_MODEL_TYPE: str = os.getenv("YOLO_MODEL_TYPE", "seg")
-    # NOTE: current best_seg.pt has weak confidence calibration (low training
-    # mAP) -- real detections top out around 0.10-0.15. Once retrained on the
-    # full real CubiCasa5k dataset this should go back up toward 0.35+.
-    YOLO_CONFIDENCE_THRESHOLD: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.05"))
+    # Inference resolution. Structural classes/fixtures do best at the training
+    # size (640); movable furniture (read from the inverted pass) does best at a
+    # larger size on dense plans -- measured on the sample CAD plans.
+    YOLO_IMAGE_SIZE: int = int(os.getenv("YOLO_IMAGE_SIZE", "640"))
+    YOLO_FURNITURE_IMAGE_SIZE: int = int(os.getenv("YOLO_FURNITURE_IMAGE_SIZE", "1280"))
+    YOLO_CONFIDENCE_THRESHOLD: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.25"))
 
     # Fallback room size (meters) used when OCR can't read a written dimension
     # from the sketch. Matches Sala_MVP's default room size.
